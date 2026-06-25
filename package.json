@@ -1,0 +1,23 @@
+{
+  "name": "baccarat-ai-ensemble",
+  "version": "1.0.0",
+  "description": "Hệ thống AI Baccarat 10 Thuật toán định hình",
+  "main": "bcr.js",
+  "scripts": {
+    "start": "node bcr.js"
+  },
+  "keywords": [
+    "baccarat",
+    "ai",
+    "ensemble",
+    "express"
+  ],
+  "author": "AI Developer",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
