@@ -4,49 +4,52 @@ const app = express();
 const API = "https://bcf-ayt4.onrender.com/sexy/all";
 
 //==============================================================================
-// 🚀 BCR PROMAX AI ENGINE V3
-// - Fix pattern follow/reverse
-// - Giảm SKIP
-// - Tách predict_total / win / lose / skip cho chuẩn
-// - Không học lẫn nhịp với chính chuỗi đang dự đoán
+// 🚀 BCR PROMAX AI ENGINE V7 - FULL CODE
+// - Markov Backoff (Order 5 → 4 → 3 → 2)
+// - Cầu (Bridge) với trọng số đồng đều 28
+// - Bridge Trust tự học từ lịch sử
+// - Cập nhật Win/Lose thực tế
+// - Pattern Confidence giảm điểm khi cầu không chắc
+// - Tất cả trọng số được cân bằng để AI tự học tối ưu
 //==============================================================================
 
 const AI_MEMORY = {
-    patterns: {},
-    markov_o2: {},
-    markov_o3: {},
-    markov_o4: {},
+    markov: {}, // markov[order][context] = {B, P}
     bayesian: { conditional: {} },
-    ngram: {},
-    ensemble: {
-        weights: {
-            markov_o2: 1.25,
-            markov_o3: 1.45,
-            markov_o4: 1.65,
-            bayesian_cond: 1.15,
-            pattern_match: 1.55,
-            ngram_pred: 1.45,
-            lstm_sliding: 1.80,
-            shannon_entropy: 1.10,
-            trend_detector: 1.90
-        },
-        meta_history: {
-            markov_o2: { win: 0, total: 0, streak: 0 },
-            markov_o3: { win: 0, total: 0, streak: 0 },
-            markov_o4: { win: 0, total: 0, streak: 0 },
-            bayesian_cond: { win: 0, total: 0, streak: 0 },
-            pattern_match: { win: 0, total: 0, streak: 0 },
-            ngram_pred: { win: 0, total: 0, streak: 0 },
-            lstm_sliding: { win: 0, total: 0, streak: 0 },
-            shannon_entropy: { win: 0, total: 0, streak: 0 },
-            trend_detector: { win: 0, total: 0, streak: 0 }
-        }
-    },
+    bridge_history: {},
+    lastPrediction: {}, // { ban: "B" hoặc "P" }
     stats: { predict_total: 0, win: 0, lose: 0, skip: 0 }
 };
 
+// ------------------- CẦU (BRIDGE) WEIGHTS ĐỒNG ĐỀU -------------------
+const BRIDGE_BASE_WEIGHTS = {
+    "BET_STRONG": 28,
+    "BET_MEDIUM": 28,
+    "PATTERN_1_1": 28,
+    "PATTERN_2_2": 28,
+    "PATTERN_2_1_2": 28,
+    "PATTERN_3_2_1": 28,
+    "PATTERN_DAO": 28,
+    "PATTERN_XIEN": 28,
+    "PATTERN_KEP": 28
+};
+
+// Trust mặc định đều bằng 1.0 - AI sẽ tự học từ dữ liệu thực tế
+const DEFAULT_TRUST = {
+    "BET_STRONG": 1.0,
+    "BET_MEDIUM": 1.0,
+    "PATTERN_1_1": 1.0,
+    "PATTERN_2_2": 1.0,
+    "PATTERN_2_1_2": 1.0,
+    "PATTERN_3_2_1": 1.0,
+    "PATTERN_DAO": 1.0,
+    "PATTERN_XIEN": 1.0,
+    "PATTERN_KEP": 1.0
+};
+
+const MAX_BRIDGE_POINTS = 35;
+
 function convert(v) {
-    if (v === "SKIP") return "Bỏ qua (Chờ thêm dữ liệu)";
     return v === "B" ? "Banker" : "Player";
 }
 function opposite(v) { return v === "B" ? "P" : "B"; }
@@ -71,299 +74,320 @@ function buildGroups(s) {
     groups.push({ side: current, len: count });
     return groups;
 }
-function getPatternKey(groups) {
-    return groups.map(v => `${v.side}${v.len}`).join("-");
+
+// ==================== GET BRIDGE TRUST TỰ HỌC ====================
+function getBridgeTrust(name) {
+    const h = AI_MEMORY.bridge_history[name];
+    if (!h || h.total < 15) {
+        return DEFAULT_TRUST[name] || 1.0;
+    }
+    const rate = h.correct / h.total;
+    // Trust = rate + bonus 0.2, nhưng giới hạn trong [0.6, 1.5]
+    return clamp(rate + 0.2, 0.6, 1.5);
 }
 
-function algoMarkovOrder2(s) {
-    if (s.length < 2) return { side: "NONE", score: 0 };
-    const data = AI_MEMORY.markov_o2[s.slice(-2)];
-    if (!data) return { side: "NONE", score: 0 };
-    const total = (data.B || 0) + (data.P || 0);
-    if (total < 3 || data.B === data.P) return { side: "NONE", score: 0 };
-    const diff = Math.abs(data.B - data.P) / total;
-    return data.B > data.P ? { side: "B", score: 1.6 + diff * 2 } : { side: "P", score: 1.6 + diff * 2 };
+// ==================== PATTERN CONFIDENCE ====================
+function getPatternConfidence(s, patternName) {
+    if (s.length < 10) return 0.7;
+    const groups = buildGroups(s);
+    const recent = groups.slice(-10);
+    let matchCount = 0;
+    let totalCheck = 0;
+
+    for (let i = 0; i < recent.length - 1; i++) {
+        const sub = recent.slice(i);
+        if (patternName.includes("BET") && sub[0] && sub[0].len >= 3) matchCount++;
+        else if (patternName.includes("1-1") && sub.length >= 2 && sub[0].len === 1 && sub[1].len === 1) matchCount++;
+        else if (patternName.includes("2-2") && sub.length >= 2 && sub[0].len === 2 && sub[1].len === 2) matchCount++;
+        else if (patternName.includes("2-1-2") && sub.length >= 3 && sub[0].len === 2 && sub[1].len === 1 && sub[2].len === 2) matchCount++;
+        else if (patternName.includes("3-2-1") && sub.length >= 3 && sub[0].len === 3 && sub[1].len === 2 && sub[2].len === 1) matchCount++;
+        totalCheck++;
+    }
+
+    const conf = totalCheck > 0 ? clamp(matchCount / totalCheck + 0.3, 0.5, 0.95) : 0.7;
+    return conf;
 }
-function algoMarkovOrder3(s) {
-    if (s.length < 3) return { side: "NONE", score: 0 };
-    const data = AI_MEMORY.markov_o3[s.slice(-3)];
-    if (!data) return { side: "NONE", score: 0 };
-    const total = (data.B || 0) + (data.P || 0);
-    if (total < 3 || data.B === data.P) return { side: "NONE", score: 0 };
-    const diff = Math.abs(data.B - data.P) / total;
-    return data.B > data.P ? { side: "B", score: 2 + diff * 2.5 } : { side: "P", score: 2 + diff * 2.5 };
+
+// ==================== PHÁT HIỆN CẦU (BRIDGE DETECTOR) ====================
+function detectBridge(s) {
+    if (s.length < 4) return { side: "NONE", weight: 0, name: "NONE", trust: 1.0, confidence: 0.7 };
+    const groups = buildGroups(s);
+    const lastGroups = groups.slice(-8);
+    if (lastGroups.length < 2) return { side: "NONE", weight: 0, name: "NONE", trust: 1.0, confidence: 0.7 };
+
+    const last = lastGroups[lastGroups.length - 1];
+    const prev = lastGroups[lastGroups.length - 2];
+    const prev2 = lastGroups.length >= 3 ? lastGroups[lastGroups.length - 3] : null;
+    const prev3 = lastGroups.length >= 4 ? lastGroups[lastGroups.length - 4] : null;
+
+    let detected = null;
+
+    // === CẦU BỆT ===
+    if (last.len >= 5) {
+        detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.BET_STRONG, name: "BET_STRONG" };
+    } else if (last.len === 4) {
+        detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.BET_STRONG, name: "BET_STRONG" };
+    } else if (last.len === 3) {
+        detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.BET_MEDIUM, name: "BET_MEDIUM" };
+    }
+    // === CẦU 1-1 ===
+    else if (lastGroups.length >= 4) {
+        const last4 = lastGroups.slice(-4);
+        if (last4.every(g => g.len === 1)) {
+            const sides = last4.map(g => g.side);
+            if (sides[0] !== sides[1] && sides[1] !== sides[2] && sides[2] !== sides[3]) {
+                detected = { side: opposite(last.side), weight: BRIDGE_BASE_WEIGHTS.PATTERN_1_1, name: "PATTERN_1_1" };
+            }
+        }
+    }
+    // === CẦU 2-2 ===
+    else if (lastGroups.length >= 2 && prev.len === 2 && last.len === 2) {
+        detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.PATTERN_2_2, name: "PATTERN_2_2" };
+    }
+    // === CẦU 2-1-2 ===
+    else if (lastGroups.length >= 3 && prev2) {
+        if (prev2.len === 2 && prev.len === 1 && last.len === 2 && prev2.side === last.side) {
+            detected = { side: prev2.side, weight: BRIDGE_BASE_WEIGHTS.PATTERN_2_1_2, name: "PATTERN_2_1_2" };
+        }
+    }
+    // === CẦU 3-2-1 ===
+    else if (lastGroups.length >= 3 && prev2) {
+        if (prev2.len === 3 && prev.len === 2 && last.len === 1) {
+            detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.PATTERN_3_2_1, name: "PATTERN_3_2_1" };
+        }
+    }
+    // === CẦU XIÊN ===
+    else if (lastGroups.length >= 3 && prev2) {
+        if (prev2.side !== prev.side && prev.side !== last.side && prev2.side === last.side) {
+            if (prev2.len >= 2 && prev.len === 1 && last.len >= 2) {
+                detected = { side: prev2.side, weight: BRIDGE_BASE_WEIGHTS.PATTERN_XIEN, name: "PATTERN_XIEN" };
+            }
+        }
+    }
+    // === CẦU KÉP ===
+    else if (lastGroups.length >= 4 && prev2 && prev3) {
+        if (prev3.len === prev2.len && prev2.len === prev.len && prev.len === last.len) {
+            const sides = [prev3.side, prev2.side, prev.side, last.side];
+            if (sides[0] === sides[2] && sides[1] === sides[3] && sides[0] !== sides[1]) {
+                detected = { side: last.side, weight: BRIDGE_BASE_WEIGHTS.PATTERN_KEP, name: "PATTERN_KEP" };
+            }
+        }
+    }
+    // === CẦU ĐẢO ===
+    else if (lastGroups.length >= 3) {
+        const last3 = lastGroups.slice(-3);
+        if (last3.every(g => g.len === 1)) {
+            const sides = last3.map(g => g.side);
+            if (sides[0] !== sides[1] && sides[1] !== sides[2]) {
+                detected = { side: opposite(last.side), weight: BRIDGE_BASE_WEIGHTS.PATTERN_DAO, name: "PATTERN_DAO" };
+            }
+        }
+    }
+
+    if (!detected) {
+        return { side: "NONE", weight: 0, name: "NONE", trust: 1.0, confidence: 0.7 };
+    }
+
+    const trust = getBridgeTrust(detected.name);
+    const confidence = getPatternConfidence(s, detected.name);
+
+    let adjustedWeight = Math.round(detected.weight * trust * confidence);
+    adjustedWeight = Math.min(adjustedWeight, MAX_BRIDGE_POINTS);
+
+    return {
+        side: detected.side,
+        weight: adjustedWeight,
+        name: detected.name,
+        trust: trust,
+        confidence: confidence
+    };
 }
-function algoMarkovOrder4(s) {
-    if (s.length < 4) return { side: "NONE", score: 0 };
-    const data = AI_MEMORY.markov_o4[s.slice(-4)];
-    if (!data) return { side: "NONE", score: 0 };
-    const total = (data.B || 0) + (data.P || 0);
-    if (total < 4 || data.B === data.P) return { side: "NONE", score: 0 };
-    const diff = Math.abs(data.B - data.P) / total;
-    return data.B > data.P ? { side: "B", score: 2.4 + diff * 3 } : { side: "P", score: 2.4 + diff * 3 };
+
+// ==================== MARKOV BACKOFF (Order 5 → 4 → 3 → 2) ====================
+function markovBackoff(s) {
+    if (s.length < 2) return { B: 0, P: 0 };
+
+    const orders = [5, 4, 3, 2];
+    for (const order of orders) {
+        if (s.length < order) continue;
+        const ctx = s.slice(-order);
+        const data = AI_MEMORY.markov[order] && AI_MEMORY.markov[order][ctx];
+        if (data && (data.B + data.P) >= 3) {
+            const total = data.B + data.P;
+            return {
+                B: Math.round((data.B / total) * 100),
+                P: Math.round((data.P / total) * 100)
+            };
+        }
+    }
+    return { B: 0, P: 0 };
 }
-function algoBayesianConditional(s) {
-    if (s.length < 2) return { side: "NONE", score: 0 };
+
+// ==================== TREND ANALYZER ====================
+function analyzeTrend(s) {
+    if (s.length < 6) return { side: "NONE", weight: 0 };
+    const block = recentSlice(s, 20);
+    const bCount = (block.match(/B/g) || []).length;
+    const total = block.length;
+    if (total < 4) return { side: "NONE", weight: 0 };
+    const pB = bCount / total;
+    const diff = Math.abs(pB - 0.5);
+    if (diff < 0.05) return { side: "NONE", weight: 0 };
+    const weight = Math.round(diff * 45);
+    return {
+        side: pB > 0.5 ? "B" : "P",
+        weight: clamp(weight, 5, 25)
+    };
+}
+
+// ==================== BAYESIAN UPDATE ====================
+function bayesianUpdate(s) {
+    if (s.length < 2) return { B: 0, P: 0 };
     const last = s[s.length - 1];
     const data = AI_MEMORY.bayesian.conditional[last];
-    if (!data || data.count < 4) return { side: "NONE", score: 0 };
+    if (!data || data.count < 3) return { B: 0, P: 0 };
     const pB = data.next_B / data.count;
     const pP = data.next_P / data.count;
     const diff = Math.abs(pB - pP);
-    if (diff < 0.08) return { side: "NONE", score: 0 };
-    return pB > pP ? { side: "B", score: 1.8 + diff * 4 } : { side: "P", score: 1.8 + diff * 4 };
-}
-function algoPatternMatching(memory, lastSide) {
-    if (!memory || !lastSide) return { side: "NONE", score: 0 };
-    const f = memory.follow || 0, r = memory.reverse || 0;
-    const total = f + r;
-    if (total < 4 || f === r) return { side: "NONE", score: 0 };
-    const diff = Math.abs(f - r) / total;
-    return f > r
-        ? { side: lastSide, score: 2.1 + diff * 3.2 }
-        : { side: opposite(lastSide), score: 2.1 + diff * 3.2 };
-}
-function algoNGramPredictor(s) {
-    if (s.length < 5) return { side: "NONE", score: 0 };
-    const data = AI_MEMORY.ngram[s.slice(-4)];
-    if (!data) return { side: "NONE", score: 0 };
-    const total = (data.B || 0) + (data.P || 0);
-    if (total < 4 || data.B === data.P) return { side: "NONE", score: 0 };
-    const diff = Math.abs(data.B - data.P) / total;
-    return data.B > data.P ? { side: "B", score: 2 + diff * 2.6 } : { side: "P", score: 2 + diff * 2.6 };
-}
-function algoDeepLSTMSlidingWindow(s) {
-    if (s.length < 10) return { side: "NONE", score: 0 };
-    const targetWindow = s.slice(-4);
-    let scoreB = 0, scoreP = 0;
-    for (let i = 0; i < s.length - 4; i++) {
-        if (s.slice(i, i + 4) === targetWindow) {
-            const ageFactor = (i + 4) / s.length;
-            const decay = 0.6 + ageFactor * 1.8;
-            if (s[i + 4] === "B") scoreB += decay;
-            if (s[i + 4] === "P") scoreP += decay;
-        }
-    }
-    if (scoreB === 0 && scoreP === 0) return { side: "NONE", score: 0 };
-    const total = scoreB + scoreP;
-    const diff = Math.abs(scoreB - scoreP) / total;
-    if (diff < 0.10) return { side: "NONE", score: 0 };
-    return scoreB > scoreP ? { side: "B", score: 2.4 + diff * 4 } : { side: "P", score: 2.4 + diff * 4 };
-}
-function algoShannonEntropy(s) {
-    if (s.length < 8) return { side: "NONE", score: 0 };
-    const block = recentSlice(s, 10);
-    const bCount = (block.match(/B/g) || []).length;
-    const total = block.length;
-    const pB = bCount / total;
-    const pP = 1 - pB;
-    const entropy = -((pB > 0 ? pB * Math.log2(pB) : 0) + (pP > 0 ? pP * Math.log2(pP) : 0));
-    const last = s[s.length - 1];
-    if (entropy < 0.55) return { side: last, score: 2.6 };
-    if (entropy > 0.96) return { side: opposite(last), score: 2.2 };
-    return { side: "NONE", score: 0 };
-}
-function algoTrendDetector(s) {
-    if (s.length < 6) return { side: "NONE", score: 0 };
-    const groups = buildGroups(s);
-    const lastGroups = groups.slice(-5);
-    const last = lastGroups[lastGroups.length - 1];
-    if (!last) return { side: "NONE", score: 0 };
-    if (last.len >= 4) return { side: last.side, score: 4.2 };
-    if (lastGroups.length >= 4) {
-        const lens = lastGroups.slice(-4).map(x => x.len);
-        if (lens.every(v => v === 1)) return { side: opposite(last.side), score: 3.5 };
-    }
-    if (lastGroups.length >= 3) {
-        const a = lastGroups[lastGroups.length - 3];
-        const b = lastGroups[lastGroups.length - 2];
-        const c = lastGroups[lastGroups.length - 1];
-        if (a.side === c.side && a.len >= 2 && b.len === 1 && c.len === 1) {
-            return { side: a.side, score: 3.0 };
-        }
-    }
-    if (last.len === 2 || last.len === 3) return { side: last.side, score: 2.2 };
-    return { side: "NONE", score: 0 };
-}
-function algoAntiNoise(s) {
-    if (s.length < 8) return { risk: 0.94 };
-    const block = recentSlice(s, 12);
-    const flips = buildGroups(block).length - 1;
-    const last4 = block.slice(-4);
-    let risk = 1.0;
-    if (flips >= 8) risk -= 0.22;
-    else if (flips >= 6) risk -= 0.12;
-    if (new Set(last4.split("")).size === 2 && buildGroups(last4).every(g => g.len === 1)) risk -= 0.08;
-    const lastGroup = buildGroups(block).slice(-1)[0];
-    if (lastGroup && lastGroup.len >= 3) risk += 0.08;
-    return { risk: clamp(risk, 0.72, 1.12) };
-}
-function getMetaMultiplier(key) {
-    const meta = AI_MEMORY.ensemble.meta_history[key];
-    if (!meta || meta.total < 5) return 1.0;
-    const winRate = meta.win / meta.total;
-    let m = 1.0;
-    if (winRate >= 0.62) m += 0.30;
-    else if (winRate >= 0.55) m += 0.15;
-    else if (winRate <= 0.38) m -= 0.28;
-    else if (winRate <= 0.45) m -= 0.12;
-    if (meta.streak >= 3) m += 0.12;
-    if (meta.streak <= -3) m -= 0.12;
-    return clamp(m, 0.55, 1.55);
+    if (diff < 0.05) return { B: 0, P: 0 };
+    return {
+        B: Math.round(pB * 100),
+        P: Math.round(pP * 100)
+    };
 }
 
-function predict(raw) {
+// ==================== SCORE FUSION ENGINE ====================
+function predict(raw, ban) {
     const s = normalizeRaw(raw);
     AI_MEMORY.stats.predict_total++;
 
     if (s.length < 4) {
         AI_MEMORY.stats.skip++;
-        return { result: "SKIP", confidence: 0, pattern: "SHORT_DATA", reason: "Chuỗi quá ngắn (<4 ván)" };
+        return {
+            result: "SKIP",
+            confidence: 0,
+            reason: "Chuỗi quá ngắn (<4 ván)",
+            details: {}
+        };
     }
 
-    const groups = buildGroups(s);
-    const recent = groups.slice(-6);
-    const pattern = getPatternKey(recent);
-    if (!AI_MEMORY.patterns[pattern]) AI_MEMORY.patterns[pattern] = { follow: 1, reverse: 1, total: 0, win: 0 };
+    // 1. MARKOV BACKOFF
+    const markov = markovBackoff(s);
+    let scoreB = markov.B || 0;
+    let scoreP = markov.P || 0;
 
-    const antiNoise = algoAntiNoise(s);
-    const lastSide = s[s.length - 1];
+    // 2. CẦU (BRIDGE) - đã giới hạn tối đa 35 điểm
+    const bridge = detectBridge(s);
+    if (bridge.side === "B") scoreB += bridge.weight;
+    else if (bridge.side === "P") scoreP += bridge.weight;
 
-    const models = [
-        { key: "markov_o2", res: algoMarkovOrder2(s) },
-        { key: "markov_o3", res: algoMarkovOrder3(s) },
-        { key: "markov_o4", res: algoMarkovOrder4(s) },
-        { key: "bayesian_cond", res: algoBayesianConditional(s) },
-        { key: "pattern_match", res: algoPatternMatching(AI_MEMORY.patterns[pattern], lastSide) },
-        { key: "ngram_pred", res: algoNGramPredictor(s) },
-        { key: "lstm_sliding", res: algoDeepLSTMSlidingWindow(s) },
-        { key: "shannon_entropy", res: algoShannonEntropy(s) },
-        { key: "trend_detector", res: algoTrendDetector(s) }
-    ];
+    // 3. TREND
+    const trend = analyzeTrend(s);
+    if (trend.side === "B") scoreB += trend.weight;
+    else if (trend.side === "P") scoreP += trend.weight;
 
-    let totalScoreB = 0, totalScoreP = 0, agreeB = 0, agreeP = 0;
-    const weights = AI_MEMORY.ensemble.weights;
-
-    for (const model of models) {
-        if (!model.res || model.res.side === "NONE" || model.res.score <= 0) continue;
-        const impact = model.res.score * (weights[model.key] || 1) * getMetaMultiplier(model.key) * antiNoise.risk;
-        if (model.res.side === "B") { totalScoreB += impact; agreeB++; }
-        if (model.res.side === "P") { totalScoreP += impact; agreeP++; }
+    // 4. BAYESIAN
+    const bayes = bayesianUpdate(s);
+    if (bayes.B > 0 && bayes.P > 0) {
+        const total = bayes.B + bayes.P;
+        const bWeight = Math.round((bayes.B / total) * 35);
+        const pWeight = Math.round((bayes.P / total) * 35);
+        scoreB += bWeight;
+        scoreP += pWeight;
     }
 
-    if ((totalScoreB + totalScoreP) === 0) {
-        AI_MEMORY.stats.skip++;
-        return { result: "SKIP", confidence: 0, pattern, reason: "Không đủ tín hiệu hội tụ" };
+    // Fallback
+    if (scoreB === 0 && scoreP === 0) {
+        if (markov.B > markov.P) { scoreB = 50; scoreP = 50; }
+        else { scoreP = 50; scoreB = 50; }
     }
 
-    const predictSide = totalScoreB > totalScoreP ? "B" : "P";
-    const winScore = Math.max(totalScoreB, totalScoreP);
-    const loseScore = Math.min(totalScoreB, totalScoreP);
-    const total = totalScoreB + totalScoreP;
-    const voteMajor = predictSide === "B" ? agreeB : agreeP;
-    const voteMinor = predictSide === "B" ? agreeP : agreeB;
+    const totalScore = scoreB + scoreP;
+    const pB = totalScore > 0 ? (scoreB / totalScore) * 100 : 50;
+    const pP = totalScore > 0 ? (scoreP / totalScore) * 100 : 50;
 
-    const scoreEdge = total > 0 ? (winScore - loseScore) / total : 0;
-    const voteEdge = (voteMajor + voteMinor) > 0 ? (voteMajor - voteMinor) / (voteMajor + voteMinor) : 0;
+    const predictSide = pB >= pP ? "B" : "P";
+    const confidence = Math.round(Math.max(pB, pP));
 
-    let confidence = Math.round(50 + scoreEdge * 32 + voteEdge * 10 + (antiNoise.risk - 1) * 30);
-    const trendRes = models.find(x => x.key === "trend_detector")?.res;
-    if (trendRes && trendRes.side === predictSide) confidence += 4;
-    if (scoreEdge < 0.08) confidence -= 8;
-    else if (scoreEdge < 0.15) confidence -= 4;
-    confidence = clamp(confidence, 35, 98);
-
-    if (confidence < 52 || voteMajor < 1) {
-        AI_MEMORY.stats.skip++;
-        return { result: "SKIP", confidence, pattern, reason: `Tín hiệu yếu (${confidence}%)` };
+    // Lưu dự đoán để cập nhật Win/Lose sau
+    if (ban) {
+        AI_MEMORY.lastPrediction[ban] = predictSide;
     }
 
-    AI_MEMORY.patterns[pattern].lastPredict = predictSide;
-    AI_MEMORY.patterns[pattern].snapshots = {};
-    for (const model of models) AI_MEMORY.patterns[pattern].snapshots[model.key] = model.res.side;
+    // Xây dựng lý do
+    const reasons = [];
+    if (markov.B > 0 || markov.P > 0) reasons.push(`✔ Markov (B:${markov.B}% P:${markov.P}%)`);
+    if (bridge.name !== "NONE") {
+        reasons.push(`✔ ${bridge.name} (+${bridge.weight}) [trust:${bridge.trust.toFixed(2)} conf:${bridge.confidence.toFixed(2)}]`);
+    }
+    if (trend.side !== "NONE") reasons.push(`✔ Xu hướng ${trend.side} (+${trend.weight})`);
+    if (bayes.B > 0 || bayes.P > 0) reasons.push(`✔ Bayesian (B:${bayes.B}% P:${bayes.P}%)`);
+
+    if (reasons.length === 0) reasons.push("⚠ Dùng Markov fallback");
 
     return {
         result: convert(predictSide),
-        confidence,
-        pattern,
-        reason: `Promax AI v3 hội tụ ${voteMajor}/${voteMajor + voteMinor} mô hình`
+        confidence: clamp(confidence, 50, 99),
+        reason: reasons.join(" | "),
+        details: {
+            markov: markov,
+            bridge: { name: bridge.name, weight: bridge.weight, trust: bridge.trust, confidence: bridge.confidence },
+            trend: trend,
+            bayesian: bayes,
+            raw_score: { B: scoreB, P: scoreP },
+            probability: { B: Math.round(pB), P: Math.round(pP) }
+        }
     };
 }
 
-function learn(raw) {
+// ==================== LEARN ====================
+function learn(raw, ban) {
     const s = normalizeRaw(raw);
     if (s.length < 3) return;
     const before = s.slice(0, -1);
     const real = s[s.length - 1];
     if (!before.length || !real) return;
 
+    // === CẬP NHẬT MARKOV (tất cả các order) ===
+    const orders = [5, 4, 3, 2];
+    for (const order of orders) {
+        if (before.length >= order) {
+            const ctx = before.slice(-order);
+            if (!AI_MEMORY.markov[order]) AI_MEMORY.markov[order] = {};
+            if (!AI_MEMORY.markov[order][ctx]) AI_MEMORY.markov[order][ctx] = { B: 0, P: 0 };
+            AI_MEMORY.markov[order][ctx][real] += 1;
+        }
+    }
+
+    // === BAYESIAN ===
     const lastBefore = before[before.length - 1];
-    if (!AI_MEMORY.bayesian.conditional[lastBefore]) AI_MEMORY.bayesian.conditional[lastBefore] = { count: 0, next_B: 0, next_P: 0 };
+    if (!AI_MEMORY.bayesian.conditional[lastBefore]) {
+        AI_MEMORY.bayesian.conditional[lastBefore] = { count: 0, next_B: 0, next_P: 0 };
+    }
     AI_MEMORY.bayesian.conditional[lastBefore].count++;
     if (real === "B") AI_MEMORY.bayesian.conditional[lastBefore].next_B++;
     else AI_MEMORY.bayesian.conditional[lastBefore].next_P++;
 
-    if (before.length >= 2) {
-        const ctx = before.slice(-2);
-        if (!AI_MEMORY.markov_o2[ctx]) AI_MEMORY.markov_o2[ctx] = { B: 1, P: 1 };
-        AI_MEMORY.markov_o2[ctx][real] += 1;
-    }
-    if (before.length >= 3) {
-        const ctx = before.slice(-3);
-        if (!AI_MEMORY.markov_o3[ctx]) AI_MEMORY.markov_o3[ctx] = { B: 1, P: 1 };
-        AI_MEMORY.markov_o3[ctx][real] += 1;
-    }
-    if (before.length >= 4) {
-        const ctx = before.slice(-4);
-        if (!AI_MEMORY.markov_o4[ctx]) AI_MEMORY.markov_o4[ctx] = { B: 1, P: 1 };
-        AI_MEMORY.markov_o4[ctx][real] += 1;
-        if (!AI_MEMORY.ngram[ctx]) AI_MEMORY.ngram[ctx] = { B: 1, P: 1 };
-        AI_MEMORY.ngram[ctx][real] += 1;
-    }
-
-    const groups = buildGroups(before);
-    const recent = groups.slice(-6);
-    const pattern = getPatternKey(recent);
-    if (!AI_MEMORY.patterns[pattern]) AI_MEMORY.patterns[pattern] = { follow: 1, reverse: 1, total: 0, win: 0 };
-
-    const lastGroup = recent[recent.length - 1];
-    if (lastGroup) {
-        if (real === lastGroup.side) AI_MEMORY.patterns[pattern].follow++;
-        else AI_MEMORY.patterns[pattern].reverse++;
-    }
-
-    const memory = AI_MEMORY.patterns[pattern];
-    if (!memory.snapshots || !memory.lastPredict) return;
-
-    const weights = AI_MEMORY.ensemble.weights;
-    const meta = AI_MEMORY.ensemble.meta_history;
-
-    for (const key of Object.keys(memory.snapshots)) {
-        const predicted = memory.snapshots[key];
-        const isCorrect = predicted === real;
-        if (!meta[key]) continue;
-
-        meta[key].total++;
-        if (isCorrect) {
-            meta[key].win++;
-            meta[key].streak = meta[key].streak >= 0 ? meta[key].streak + 1 : 1;
-        } else {
-            meta[key].streak = meta[key].streak <= 0 ? meta[key].streak - 1 : -1;
+    // === CẬP NHẬT BRIDGE HISTORY ===
+    const bridge = detectBridge(before);
+    if (bridge.name !== "NONE") {
+        if (!AI_MEMORY.bridge_history[bridge.name]) {
+            AI_MEMORY.bridge_history[bridge.name] = { correct: 0, total: 0 };
         }
-
-        if (weights[key] !== undefined) {
-            let delta = isCorrect ? 0.04 : -0.05;
-            if (meta[key].streak >= 3) delta += 0.02;
-            if (meta[key].streak <= -3) delta -= 0.02;
-            weights[key] = clamp(weights[key] + delta, 0.35, 4.8);
-        }
+        AI_MEMORY.bridge_history[bridge.name].total++;
+        if (bridge.side === real) AI_MEMORY.bridge_history[bridge.name].correct++;
     }
 
-    if (memory.lastPredict === real) AI_MEMORY.stats.win++;
-    else AI_MEMORY.stats.lose++;
-    memory.total++;
+    // === CẬP NHẬT WIN/LOSE ===
+    if (ban && AI_MEMORY.lastPrediction[ban]) {
+        const pred = AI_MEMORY.lastPrediction[ban];
+        if (pred === real) AI_MEMORY.stats.win++;
+        else AI_MEMORY.stats.lose++;
+        delete AI_MEMORY.lastPrediction[ban];
+    }
 }
 
+// ==================== API ====================
 app.get("/dudoan/sexy/all", async (req, res) => {
     try {
         const r = await fetch(API);
@@ -371,12 +395,11 @@ app.get("/dudoan/sexy/all", async (req, res) => {
 
         const result = data.map(item => {
             const raw = normalizeRaw(item.ket_qua || "");
+            const ban = item.ban || `ban_${item.phien}`;
 
-            // học trên dữ liệu quá khứ của chính chuỗi
-            learn(raw);
+            learn(raw, ban);
 
-            // dự đoán phiên tiếp theo từ toàn bộ chuỗi hiện có
-            const ai = predict(raw);
+            const ai = predict(raw, ban);
             const lastRaw = raw.length ? raw[raw.length - 1] : "";
 
             return {
@@ -386,16 +409,16 @@ app.get("/dudoan/sexy/all", async (req, res) => {
                 ket_qua: raw,
                 phien_hien_tai: Number(item.phien) + 1,
                 du_doan: ai.result,
-                do_tin_cay: `${ai.confidence || 0}%`,
+                do_tin_cay: `${ai.confidence}%`,
                 ly_do: ai.reason,
-                pattern_hien_tai: ai.pattern
+                chi_tiet: ai.details
             };
         });
 
         const betTotal = AI_MEMORY.stats.win + AI_MEMORY.stats.lose;
         res.json({
             success: true,
-            engine: "BCR PROMAX AI v3",
+            engine: "BCR PROMAX AI v7 - Full Code",
             ai_stats: {
                 predict_total: AI_MEMORY.stats.predict_total,
                 bet_total: betTotal,
@@ -404,6 +427,7 @@ app.get("/dudoan/sexy/all", async (req, res) => {
                 skip: AI_MEMORY.stats.skip,
                 win_rate: betTotal > 0 ? `${((AI_MEMORY.stats.win / betTotal) * 100).toFixed(2)}%` : "0%"
             },
+            bridge_history: AI_MEMORY.bridge_history,
             total_room: result.length,
             data: result
         });
@@ -413,4 +437,4 @@ app.get("/dudoan/sexy/all", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`BCR PROMAX AI v3 đang chạy tại cổng ${PORT}`));
+app.listen(PORT, () => console.log(`BCR PROMAX AI v7 đang chạy tại cổng ${PORT}`));
